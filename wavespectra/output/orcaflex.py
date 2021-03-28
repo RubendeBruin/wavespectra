@@ -6,16 +6,12 @@ def to_orcaflex(self, model, minEnergy = 1e-6):
 
     Args:
         - model : orcaflex model (OrcFxAPI.model instance)
+        - minEnergy [1e-6] : threshold for minimum sum of energy in a direction before it is exported
 
     """
 
     dirs = np.array(self.dir.values)
     freqs = np.array(self.freq.values)
-
-    data = np.array(self.efth.values)
-
-    if len(data.shape) > 2:
-        data = data[:,:,0]
 
     ddir = self.dd
 
@@ -23,8 +19,8 @@ def to_orcaflex(self, model, minEnergy = 1e-6):
     env = model.environment  #alias
 
     for dir in dirs:
-        i_dir = np.where(dirs == dir)
-        e = data[:,i_dir].flatten()
+        e = self.efth.sel(dict(dir=dir))
+
         E = ddir * e
 
         if np.sum(E) <= minEnergy:
@@ -54,6 +50,9 @@ def to_orcaflex(self, model, minEnergy = 1e-6):
         env.WaveNumberOfUserSpectralPoints = len(E[iFirst:iLast])
         env.WaveSpectrumS = E[iFirst:iLast]
         env.WaveSpectrumFrequency = freqs[iFirst:iLast]  # convert o rad/s
+
+    if nTrains == 0:
+        raise ValueError("No data exported, no directions with more than the minimum amount of energy")
 
 
 

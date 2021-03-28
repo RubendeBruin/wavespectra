@@ -21,7 +21,7 @@ def read_record(f):
             return None
 
 
-    meta = line.split(',')[0]
+    meta = line.split(',')[0].rstrip('\n')
     nfreqs = int(f.readline().split(',')[1])
     ndirs = int(f.readline().split(',')[1])
     nrecs = int(f.readline().split(',')[1])

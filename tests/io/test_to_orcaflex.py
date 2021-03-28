@@ -16,8 +16,7 @@ class TestToOrcaflex(object):
     @classmethod
     def setup_class(self):
         """Setup class."""
-        self.tmp_dir = mkdtemp()
-        self.example = read_argoss_csv(os.path.join(FILES_DIR, "ARGOSS_example.csv"))
+        self.example = read_argoss_csv(os.path.join(FILES_DIR, "ARGOSS_example.csv")).isel(time=0)
 
     def test_write_to_orcaflex(self):
 
@@ -25,8 +24,48 @@ class TestToOrcaflex(object):
             import OrcFxAPI
             m = OrcFxAPI.Model()
         except:
+            print("Orcaflex test skipped because no license or no api")
             return
 
         self.example.spec.to_orcaflex(m, 20)
+
+    def test_compare_spectra(self):
+
+        import matplotlib.pyplot as plt
+
+
+        try:
+            import OrcFxAPI
+            m = OrcFxAPI.Model()
+        except:
+            print("Orcaflex test skipped because no license or no api")
+            return
+
+        self.example.spec.to_orcaflex(m)
+        m.general.StageDuration[1]=10800 # 3 hours of simulations
+        m.RunSimulation()
+
+        m.SaveData(r'c:\data\test.dat')
+
+        t = m.general.TimeHistory('Time')
+        e = m.environment.TimeHistory('Elevation', None, objectExtra=OrcFxAPI.oeEnvironment(0,0,0))
+
+        plt.plot(t[1000:2000],e[1000:2000], linewidth=0.5)
+        plt.show()
+
+        from scipy.signal import welch, periodogram
+        dt = t[1] - t[0]
+        f, p = welch(e, 1/dt)
+        plt.plot(f,p, label = 'welch')
+
+        self.example.spec.oned().plot(label = 'source spectrun')
+
+
+
+        plt.show()
+
+
+
+
 
 
