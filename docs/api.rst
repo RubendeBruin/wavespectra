@@ -43,8 +43,6 @@ All methods in :py:class:`SpecArray` accessor are also available from  :py:class
    SpecArray.dpw
    SpecArray.swe
    SpecArray.sw
-   SpecArray.momf
-   SpecArray.momd
 
 **Spectral partitioning**
 
@@ -61,6 +59,8 @@ All methods in :py:class:`SpecArray` accessor are also available from  :py:class
    :nosignatures:
    :toctree: generated/
 
+   SpecArray.momf
+   SpecArray.momd
    SpecArray.wavelen
    SpecArray.celerity
    SpecArray.stats
@@ -168,7 +168,19 @@ api is not properly established.
 Internal core functions and objects
 -----------------------------------
 
-**attrubutes module**
+**watershed module**
+
+.. autosummary::
+   :nosignatures:
+   :toctree: generated/
+
+   core.watershed.partition
+   core.watershed.npart
+   core.watershed.hs
+   core.watershed.frequency_resolution
+   core.watershed.inflection
+
+**attributes module**
 
 .. autosummary::
    :nosignatures:
@@ -176,6 +188,28 @@ Internal core functions and objects
 
    core.attributes.set_spec_attributes
    core.attributes.attrs
+
+**npstats**
+
+.. autosummary::
+   :nosignatures:
+   :toctree: generated/
+
+   core.npstats.hs_gufunc
+   core.npstats.dpm_gufunc
+   core.npstats.dp_gufunc
+   core.npstats.tps_gufunc
+   core.npstats.tp_gufunc
+
+**xrstats**
+
+.. autosummary::
+   :nosignatures:
+   :toctree: generated/
+
+   core.xrstats.peak_wave_direction
+   core.xrstats.mean_direction_at_peak_wave_period
+   core.xrstats.peak_wave_period
 
 **select module**
 
@@ -190,28 +224,23 @@ Internal core functions and objects
    core.select.Coordinates.nearer
    core.select.Coordinates.nearest
 
-**misc module**
+**utils module**
 
 .. autosummary::
    :nosignatures:
    :toctree: generated/
 
-   core.misc.dnum_to_datetime
-   core.misc.to_nautical
-   core.misc.unique_times
-   core.misc.to_datetime
-   core.misc.spddir_to_uv
-   core.misc.uv_to_spddir
-   core.misc.interp_spec
-   core.misc.flatten_list
-
-**timer module**
-
-.. autosummary::
-   :nosignatures:
-   :toctree: generated/
-
-   core.timer.Timer
+   core.utils.wavelen
+   core.utils.wavenuma
+   core.utils.celerity
+   core.utils.dnum_to_datetime
+   core.utils.to_nautical
+   core.utils.unique_times
+   core.utils.to_datetime
+   core.utils.spddir_to_uv
+   core.utils.uv_to_spddir
+   core.utils.interp_spec
+   core.utils.flatten_list
 
 **swan module**
 

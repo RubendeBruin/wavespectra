@@ -18,80 +18,89 @@ import warnings
 
 from wavespectra.plot import _PlotMethods
 from wavespectra.core.attributes import attrs
-from wavespectra.core.misc import D2R, R2D
+from wavespectra.core.utils import D2R, R2D, celerity, wavenuma, wavelen
+from wavespectra.core.watershed import partition
+from wavespectra.core import xrstats
 
-try:
-    from sympy import Symbol
-    from sympy.utilities.lambdify import lambdify
-    from sympy.parsing.sympy_parser import parse_expr
-except ImportError:
-    warnings.warn(
-        'Cannot import sympy, install "extra" dependencies for full functionality'
-    )
 
 # TODO: dimension renaming and sorting in __init__ are not producing intended effect.
 #       They correctly modify xarray_obj as defined in xarray.spec._obj but the actual
 #       xarray is not modified - and they loose their direct association
 
-_ = np.newaxis
-
 
 @xr.register_dataarray_accessor("spec")
 class SpecArray(object):
-    """Extends xarray's DataArray to deal with wave spectra arrays."""
+    """Extends DataArray with methods to deal with wave spectra."""
 
-    def __init__(self, xarray_obj, dim_map=None):
-        """Define spectral attributes."""
-        # # Rename spectra coordinates if not 'freq' and/or 'dir'
-        # if 'dim_map' is not None:
-        #     xarray_obj = xarray_obj.rename(dim_map)
-
-        # # Ensure frequencies and directions are sorted
-        # for dim in [attrs.FREQNAME, attrs.DIRNAME]:
-        #     if (dim in xarray_obj.dims
-        #         and not self._strictly_increasing(xarray_obj[dim].values)):
-        #         xarray_obj = self._obj.sortby([dim])
-
+    def __init__(self, xarray_obj):
+        """Initialise spec accessor."""
         self._obj = xarray_obj
-        self._non_spec_dims = set(self._obj.dims).difference(
-            (attrs.FREQNAME, attrs.DIRNAME)
-        )
 
-        # Create attributes for accessor
-        self.freq = xarray_obj.freq
-        self.dir = xarray_obj.dir if attrs.DIRNAME in xarray_obj.dims else None
-
-        self.df = (
-            abs(self.freq[1:].values - self.freq[:-1].values)
-            if len(self.freq) > 1
-            else np.array((1.0,))
-        )
-        self.dd = (
-            abs(self.dir[1].values - self.dir[0].values)
-            if self.dir is not None and len(self.dir) > 1
-            else 1.0
-        )
-
-        # df darray with freq dimension - may replace above one in the future
-        if len(self.freq) > 1:
-            self.dfarr = xr.DataArray(
-                data=np.hstack((1.0, np.full(len(self.freq) - 2, 0.5), 1.0))
-                * (
-                    np.hstack((0.0, np.diff(self.freq)))
-                    + np.hstack((np.diff(self.freq), 0.0))
-                ),
-                coords={attrs.FREQNAME: self.freq},
-                dims=(attrs.FREQNAME),
-            )
-        else:
-            self.dfarr = xr.DataArray(
-                data=np.array((1.0,)),
-                coords={attrs.FREQNAME: self.freq},
-                dims=(attrs.FREQNAME),
-            )
+        # These are set when property is first called to avoid computing more than once
+        self._df = None
+        self._dd = None
+        self._dfarr = None
 
     def __repr__(self):
         return re.sub(r"<([^\s]+)", "<%s" % (self.__class__.__name__), str(self._obj))
+
+    @property
+    def freq(self):
+        """Frequency DataArray."""
+        return self._obj.freq
+
+    @property
+    def dir(self):
+        """Direction DataArray."""
+        if attrs.DIRNAME in self._obj.dims:
+            return self._obj[attrs.DIRNAME]
+        else:
+            return None
+
+    @property
+    def _non_spec_dims(self):
+        """Return the set of non-spectral dimensions in underlying dataset."""
+        return set(self._obj.dims).difference((attrs.FREQNAME, attrs.DIRNAME))
+
+    @property
+    def dfarr(self):
+        """Frequency resolution DataArray."""
+        if self._dfarr is not None:
+            return self._dfarr
+        if len(self.freq) > 1:
+            fact = np.hstack((1.0, np.full(self.freq.size - 2, 0.5), 1.0))
+            ldif = np.hstack((0.0, np.diff(self.freq)))
+            rdif = np.hstack((np.diff(self.freq), 0.0))
+            self._dfarr = xr.DataArray(data=fact * (ldif + rdif), coords=self.freq.coords)
+        else:
+            self._dfarr = xr.DataArray( data=np.array((1.0,)), coords=self.freq.coords)
+        return self._dfarr
+
+    @property
+    def df(self):
+        """Frequency resolution numpy array.
+
+        TODO: Check if this can be removed in favor of dfarr.
+
+        """
+        if self._df is not None:
+            return self._df
+        if len(self.freq) > 1:
+            self._df = abs(self.freq[1:].values - self.freq[:-1].values)
+        else:
+            self._df = np.array((1.0,))
+        return self._df
+
+    @property
+    def dd(self):
+        """Direction resolution float."""
+        if self._dd is not None:
+            return self._dd
+        if self.dir is not None and len(self.dir) > 1:
+            self._dd = abs(float(self.dir[1] - self.dir[0]))
+        else:
+            self._dd = 1.0
+        return self._dd
 
     def _strictly_increasing(self, arr):
         """Check if array is sorted in increasing order."""
@@ -121,89 +130,45 @@ class SpecArray(object):
             otherwise same dimensions as self._obj
 
         """
-        assert (
-            self.freq.min() < fint < self.freq.max()
-        ), "Spectra must have frequencies smaller and greater than fint"
+        if not (self.freq.min() < fint < self.freq.max()):
+            raise ValueError(
+                f"fint must be within freq range {self.freq.values}, got {fint}"
+            )
         ifreq = self.freq.searchsorted(fint)
         df = np.diff(self.freq.isel(freq=[ifreq - 1, ifreq]))[0]
-        Sint = self._obj.isel(freq=[ifreq]) * (
-            fint - self.freq.isel(freq=[ifreq - 1]).values
-        ) + self._obj.isel(freq=[ifreq - 1]).values * (
-            self.freq.isel(freq=[ifreq]).values - fint
-        )
-        Sint = Sint.assign_coords({"freq": [fint]})
-        return Sint / df
+
+        right = self._obj.isel(freq=[ifreq]) * (fint - self.freq[ifreq - 1])
+        left = self._obj.isel(freq=[ifreq - 1]) * (self.freq[ifreq] - fint)
+
+        right = right.assign_coords({"freq": [fint]})
+        left = left.assign_coords({"freq": [fint]})
+
+        return (left + right) / df
 
     def _peak(self, arr):
         """Returns indices of largest peaks along freq dim in a ND-array.
 
         Args:
-            arr (SpecArray): 1D spectra (integrated over directions)
+            - arr (SpecArray): 1D spectra (integrated over directions)
 
         Returns:
-            ipeak (SpecArray): indices for slicing arr at the frequency peak
+            - ipeak (SpecArray): indices for slicing arr at the frequency peak
 
         Note:
-            A peak is found when arr(ipeak-1) < arr(ipeak) < arr(ipeak+1)
-            ipeak==0 does not satisfy above condition and is assumed to be
-                missing_value in other parts of the code
+            - Peak is defined IFF arr(ipeak-1) < arr(ipeak) < arr(ipeak+1).
+            - Values at the array boundary do not satisfy above condition and treated
+              as missing_value in other parts of the code.
+            - Flat peaks are ignored by this criterium.
+
         """
-        ispeak = np.logical_and(
-            xr.concat((arr.isel(freq=0), arr), dim=attrs.FREQNAME).diff(
-                attrs.FREQNAME, n=1, label="upper"
-            )
-            > 0,
-            xr.concat((arr, arr.isel(freq=-1)), dim=attrs.FREQNAME).diff(
+        fwd = xr.concat((arr.isel(freq=0), arr), dim=attrs.FREQNAME).diff(
+            attrs.FREQNAME, n=1, label="upper"
+        ) > 0
+        bwd = xr.concat((arr, arr.isel(freq=-1)), dim=attrs.FREQNAME).diff(
                 attrs.FREQNAME, n=1, label="lower"
-            )
-            < 0,
-        )
-        ipeak = arr.where(ispeak).fillna(0).argmax(dim=attrs.FREQNAME).astype(int)
-        return ipeak
-
-    def _product(self, dict_of_ids):
-        """Dot product of a dictionary of ids used to construct arbitrary slicing dicts.
-
-        Example:
-            Input dictionary :: {'site': [0,1], 'time': [0,1]}
-            Output iterator :: {'site': 0, 'time': 0}
-                               {'site': 0, 'time': 1}
-                               {'site': 1, 'time': 0}
-                               {'site': 1, 'time': 1}
-
-        """
-        return (dict(zip(dict_of_ids, x)) for x in product(*iter(dict_of_ids.values())))
-
-    def _inflection(self, fdspec, dfres=0.01, fmin=0.05):
-        """Finds points of inflection in smoothed frequency spectra.
-
-        Args:
-            fdspec (ndarray): freq-dir 2D specarray
-            dfres (float): used to determine length of smoothing window
-            fmin (float): minimum frequency for looking for minima/maxima
-
-        """
-        if len(self.freq) > 1:
-            sf = fdspec.sum(axis=1)
-            nsmooth = int(dfres / self.df[0])  # Window size
-            if nsmooth > 1:
-                sf = np.convolve(sf, np.hamming(nsmooth), "same")  # Smoothed f-spectrum
-            sf[(sf < 0) | (self.freq.values < fmin)] = 0
-            diff = np.diff(sf)
-            imax = np.argwhere(np.diff(np.sign(diff)) == -2) + 1
-            imin = np.argwhere(np.diff(np.sign(diff)) == 2) + 1
-        else:
-            imax = 0
-            imin = 0
-        return imax, imin
-
-    def _same_dims(self, other):
-        """Check if another SpecArray has same non-spectral dims.
-
-        Used to ensure consistent slicing
-
-        """
-        return set(other.dims) == self._non_spec_dims
+        ) < 0
+        ispeak = np.logical_and(fwd, bwd)
+        return arr.where(ispeak, 0).argmax(dim=attrs.FREQNAME).astype(int)
 
     def _my_name(self):
         """Returns the caller's name."""
@@ -264,7 +229,7 @@ class SpecArray(object):
         else:
             return self._obj.copy(deep=True)
 
-    def split(self, fmin=None, fmax=None, dmin=None, dmax=None):
+    def split(self, fmin=None, fmax=None, dmin=None, dmax=None, rechunk=True):
         """Split spectra over freq and/or dir dims.
 
         Args:
@@ -272,9 +237,11 @@ class SpecArray(object):
             - fmax (float): highest frequency to split spectra, by default the highest.
             - dmin (float): lowest direction to split spectra at, by default min(dir).
             - dmax (float): highest direction to split spectra at, by default max(dir).
+            - rechunk (bool): Rechunk split dims so there is one single chunk.
 
         Note:
-            - spectra are interpolated at `fmin` / `fmax` if they are not in self.freq.
+            - Spectra are interpolated at `fmin` / `fmax` if they are not in self.freq.
+            - Recommended rechunk==True so ufuncs with freq/dir as core dims will work.
 
         """
         if fmax is not None and fmin is not None and fmax <= fmin:
@@ -299,6 +266,9 @@ class SpecArray(object):
 
         other.freq.attrs = self._obj.freq.attrs
         other.dir.attrs = self._obj.dir.attrs
+
+        if rechunk:
+            other = other.chunk({attrs.FREQNAME: None, attrs.DIRNAME: None})
 
         return other
 
@@ -363,7 +333,6 @@ class SpecArray(object):
     def scale_by_hs(
         self,
         expr,
-        inplace=True,
         hs_min=-np.inf,
         hs_max=np.inf,
         tp_min=-np.inf,
@@ -371,78 +340,41 @@ class SpecArray(object):
         dpm_min=-np.inf,
         dpm_max=np.inf,
     ):
-        """Scale spectra using equation based on Significant Wave Height Hs.
+        """Scale spectra using expression based on Significant Wave Height hs.
 
         Args:
             - expr (str): expression to apply, e.g. '0.13*hs + 0.02'.
-            - inplace (bool): True to apply transformation in place, False otherwise.
-            - hs_min, hs_max (float): Hs range over which expr is applied.
-            - tp_min, tp_max (float): Tp range over which expr is applied.
-            - dpm_min, dpm_max (float) Dpm range over which expr is applied.
+            - hs_min, hs_max, tp_min, tp_max, dpm_min, dpm_max (float): Ranges of hs,
+                tp and dpm over which the scaling defined by `expr` is applied.
 
         """
-        func = lambdify(Symbol("hs"), parse_expr(expr.lower()), modules=["numpy"])
+        # Scale spectra by hs expression
         hs = self.hs()
-        k = (func(hs) / hs) ** 2
+        k = (eval(expr.lower()) / hs) ** 2
         scaled = k * self._obj
-        if any(
-            [
-                abs(arg) != np.inf
-                for arg in [hs_min, hs_max, tp_min, tp_max, dpm_min, dpm_max]
-            ]
-        ):
-            tp = self.tp()
-            dpm = self.dpm()
-            scaled = scaled.where(
-                (
-                    (hs >= hs_min)
-                    & (hs <= hs_max)
-                    & (tp >= tp_min)
-                    & (tp <= tp_max)
-                    & (dpm >= dpm_min)
-                    & (dpm <= dpm_max)
-                )
-            ).combine_first(self._obj)
-        if inplace:
-            self._obj.values = scaled.values
-        else:
-            return scaled
 
-    def tp(self, smooth=True, mask=np.nan):
+        # Condition over which scaling applies
+        condition = True
+        if hs_min != -np.inf or hs_max != np.inf:
+            condition *= (hs >= hs_min) & (hs <= hs_max)
+        if tp_min != -np.inf or tp_max != np.inf:
+            tp = self.tp()
+            condition *= (tp >= tp_min) & (tp <= tp_max)
+        if dpm_min != -np.inf or dpm_max != np.inf:
+            dpm = self.dpm()
+            condition *= (dpm >= dpm_min) & (dpm <= dpm_max)
+
+        return scaled.where(condition, self._obj)
+
+    def tp(self, smooth=True):
         """Peak wave period Tp.
 
         Args:
             - smooth (bool): True for the smooth wave period, False for the discrete
-              period corresponding to the maxima in the direction-integrated spectra.
-            - mask (float): value for missing data if there is no peak in spectra.
-
-        Warning: This method cannot be computed lazily.
+              period corresponding to the maxima in the frequency spectra.
 
         """
-        if len(self.freq) < 3:
-            return None
-        Sf = self.oned()
-        ipeak = self._peak(Sf).load()
-        fp = self.freq.astype("float64")[ipeak].drop_vars("freq")
-        if smooth:
-            f1, f2, f3 = [self.freq[ipeak + i].values for i in [-1, 0, 1]]
-            e1, e2, e3 = [Sf.isel(freq=ipeak + i).values for i in [-1, 0, 1]]
-            s12 = f1 + f2
-            q12 = (e1 - e2) / (f1 - f2)
-            q13 = (e1 - e3) / (f1 - f3)
-            qa = (q13 - q12) / (f3 - f2)
-            qa = np.ma.masked_array(qa, qa >= 0)
-            ind = ~qa.mask
-            fpsmothed = (s12[ind] - q12[ind] / qa[ind]) / 2.0
-            fp.values[ind] = fpsmothed
-        tp = (1 / fp).where(ipeak > 0).fillna(mask).rename("tp")
-        tp.attrs.update(
-            {
-                "standard_name": self._standard_name(self._my_name()),
-                "units": self._units(self._my_name()),
-            }
-        )
-        return tp
+        return xrstats.peak_wave_period(self._obj, smooth=smooth)
 
     def momf(self, mom=0):
         """Calculate given frequency moment."""
@@ -453,9 +385,9 @@ class SpecArray(object):
         )
 
     def momd(self, mom=0, theta=90.0):
+        """Calculate given directional moment."""
         if self.dir is None:
             raise ValueError("Cannot calculate momd from 1d, frequency spectra.")
-        """Calculate given directional moment."""
         cp = np.cos(np.radians(180 + theta - self.dir)) ** mom
         sp = np.sin(np.radians(180 + theta - self.dir)) ** mom
         msin = (self.dd * self._obj * sp).sum(dim=attrs.DIRNAME, skipna=False)
@@ -519,55 +451,18 @@ class SpecArray(object):
         frequency-integrated spectrum is maximum.
 
         """
-        if self.dir is None:
-            raise ValueError("Cannot calculate dp from 1d, frequency spectra.")
-        ipeak = self._obj.sum(dim=attrs.FREQNAME).argmax(dim=attrs.DIRNAME)
-        template = self._obj.sum(dim=attrs.FREQNAME, skipna=False).sum(
-            dim=attrs.DIRNAME, skipna=False
-        )
-        dp = self.dir.values[ipeak.values] * (0 * template + 1)
-        dp.attrs.update(
-            {
-                "standard_name": self._standard_name(self._my_name()),
-                "units": self._units(self._my_name()),
-            }
-        )
-        return dp.rename(self._my_name())
+        return xrstats.peak_wave_direction(self._obj)
 
-    def dpm(self, mask=np.nan):
+    def dpm(self):
         """Peak wave direction Dpm.
 
-        From WW3 Manual: peak wave direction, defined like the mean direction,
-        using the frequency/wavenumber bin containing of the spectrum F(k)
-        that contains the peak frequency only.
-
-        Args:
-            - mask (float): value for missing data in output.
-
-        Warning: This method cannot be computed lazily.
+        Note From WW3 Manual:
+            - peak wave direction, defined like the mean direction, using the
+              frequency/wavenumber bin containing of the spectrum F(k) that contains
+              the peak frequency only.
 
         """
-        if self.dir is None:
-            raise ValueError("Cannot calculate dpm from 1d, frequency spectra.")
-        ipeak = self._peak(self.oned())
-        moms, momc = self.momd(1)
-        moms_peak = self._collapse_array(
-            moms.values, ipeak.values, axis=moms.get_axis_num(dim=attrs.FREQNAME)
-        )
-        momc_peak = self._collapse_array(
-            momc.values, ipeak.values, axis=momc.get_axis_num(dim=attrs.FREQNAME)
-        )
-        dpm = np.arctan2(moms_peak, momc_peak) * (
-            ipeak * 0 + 1
-        )  # Cheap way to turn dp into appropriate DataArray
-        dpm = (270 - R2D * dpm) % 360.0
-        dpm.attrs.update(
-            {
-                "standard_name": self._standard_name(self._my_name()),
-                "units": self._units(self._my_name()),
-            }
-        )
-        return dpm.where(ipeak > 0).fillna(mask).rename(self._my_name())
+        return xrstats.mean_direction_at_peak_wave_period(self._obj)
 
     def dspr(self):
         """Directional wave spreading Dspr.
@@ -606,10 +501,8 @@ class SpecArray(object):
         crsd = (self.dd * self._obj * cp * sp).sum(dim=attrs.DIRNAME)
         crsd.attrs.update(
             {
-                "standard_name",
-                self._standard_name(self._my_name()),
-                "units",
-                self._units(self._my_name()),
+                "standard_name": self._standard_name(self._my_name()),
+                "units": self._units(self._my_name()),
             }
         )
         return crsd.rename(self._my_name())
@@ -701,11 +594,9 @@ class SpecArray(object):
         wsp_darr,
         wdir_darr,
         dep_darr,
+        swells=3,
         agefac=1.7,
         wscut=0.3333,
-        hs_min=0.001,
-        nearest=False,
-        max_swells=5,
     ):
         """Partition wave spectra using Hanson's watershed algorithm.
 
@@ -715,129 +606,40 @@ class SpecArray(object):
             - wsp_darr (DataArray): wind speed (m/s).
             - wdir_darr (DataArray): Wind direction (degree).
             - dep_darr (DataArray): Water depth (m).
+            - swells (int): Number of swell partitions to compute.
             - agefac (float): Age factor.
             - wscut (float): Wind speed cutoff.
-            - hs_min (float): minimum Hs for assigning swell partition.
-            - nearest (bool): if True, wsp, wdir and dep are allowed to be taken from
-              nearest point if not matching positions in SpecArray (slower).
-            - max_swells: maximum number of swells to extract
 
         Returns:
             - part_spec (SpecArray): partitioned spectra with one extra dimension
               representig partition number.
 
         Note:
-            - All input DataArray objects must have same non-spectral
-              dimensions as SpecArray.
+            - Input DataArrays must have same non-spectral dims as SpecArray.
 
         References:
             - Hanson, Jeffrey L., et al. "Pacific hindcast performance of three
               numerical wave models." JTECH 26.8 (2009): 1614-1633.
 
         """
-        # Assert spectral dims are present in spectra and non-spectral dims are present
-        # in winds and depths
-        assert attrs.FREQNAME in self._obj.dims and attrs.DIRNAME in self._obj.dims, (
-            "partition requires E(freq,dir) but freq|dir "
-            "dimensions not in SpecArray dimensions (%s)" % (self._obj.dims)
-        )
+        # Assert expected dimensions are defined
+        if not {attrs.FREQNAME, attrs.DIRNAME}.issubset(self._obj.dims):
+            raise ValueError(f"(freq, dir) dims required, only found {self._obj.dims}")
         for darr in (wsp_darr, wdir_darr, dep_darr):
-            # Conditional below aims at allowing wsp, wdir, dep to be DataArrays
-            # within the SpecArray. not working yet.
-            if isinstance(darr, str):
-                darr = getattr(self, darr)
-            assert set(darr.dims) == self._non_spec_dims, (
-                "%s dimensions (%s) need matching non-spectral dimensions "
-                "in SpecArray (%s) for consistent slicing"
-                % (darr.name, set(darr.dims), self._non_spec_dims)
-            )
+            if set(darr.dims) != self._non_spec_dims:
+                raise ValueError(
+                    f"{darr.name} dims {list(darr.dims)} need matching "
+                    f"non-spectral dims in SpecArray {self._non_spec_dims}"
+                )
 
-        from wavespectra.core import specpart
-
-        # Initialise output - one SpecArray for each partition
-        all_parts = [0 * self._obj.load() for i in range(1 + max_swells)]
-
-        # Predefine these for speed
-        dirs = self.dir.values
-        freqs = self.freq.values
-        ndir = len(dirs)
-        nfreq = len(freqs)
-        wsp_darr.load()
-        wdir_darr.load()
-        dep_darr.load()
-
-        # Slice each possible 2D, freq-dir array out of the full data array
-        slice_ids = {dim: range(self._obj[dim].size) for dim in self._non_spec_dims}
-        for slice_dict in self._product(slice_ids):
-            spectrum = self._obj[slice_dict].values
-            if nearest:
-                slice_dict_nearest = {
-                    key: self._obj[key][val].values for key, val in slice_dict.items()
-                }
-                wsp = float(wsp_darr.sel(method="nearest", **slice_dict_nearest))
-                wdir = float(wdir_darr.sel(method="nearest", **slice_dict_nearest))
-                dep = float(dep_darr.sel(method="nearest", **slice_dict_nearest))
-            else:
-                wsp = float(wsp_darr[slice_dict])
-                wdir = float(wdir_darr[slice_dict])
-                dep = float(dep_darr[slice_dict])
-
-            Up = agefac * wsp * np.cos(D2R * (dirs - wdir))
-            windbool = np.tile(Up, (nfreq, 1)) > np.tile(
-                celerity(freqs, dep)[:, _], (1, ndir)
-            )
-
-            part_array = specpart.partition(spectrum)
-
-            ipeak = 1  # values from specpart.partition start at 1
-            part_array_max = part_array.max()
-            partitions_hs_swell = np.zeros(part_array_max + 1)  # zero is used for sea
-            while ipeak <= part_array_max:
-                part_spec = np.where(part_array == ipeak, spectrum, 0.0)
-
-                # Assign new partition if multiple valleys and satisfying conditions
-                imax, imin = self._inflection(part_spec, dfres=0.01, fmin=0.05)
-                if len(imin) > 0:
-                    # TODO: Deal with more than one imin value ?
-                    part_spec_new = part_spec.copy()
-                    part_spec_new[imin[0].squeeze() :, :] = 0
-                    newpart = part_spec_new > 0
-                    if newpart.sum() > 20:
-                        part_spec[newpart] = 0
-                        part_array_max += 1
-                        part_array[newpart] = part_array_max
-                        partitions_hs_swell = np.append(partitions_hs_swell, 0)
-
-                # Group sea partitions and sort swells by hs
-                W = part_spec[windbool].sum() / part_spec.sum()
-                if W > wscut:
-                    part_array[part_array == ipeak] = 0  # mark as windsea
-                else:
-                    partitions_hs_swell[ipeak] = hs(part_spec, freqs, dirs)
-
-                ipeak += 1
-
-            num_swells = min(max_swells, sum(partitions_hs_swell > hs_min))
-
-            sorted_swells = np.flipud(partitions_hs_swell[1:].argsort() + 1)
-            parts = np.concatenate(([0], sorted_swells[:num_swells]))
-            for ind, part in enumerate(parts):
-                all_parts[ind][slice_dict] = np.where(part_array == part, spectrum, 0.0)
-
-        # Concatenate partitions along new axis
-        part_coord = xr.DataArray(
-            data=range(len(all_parts)),
-            coords={"part": range(len(all_parts))},
-            dims=("part",),
-            name="part",
-            attrs={"standard_name": "spectral_partition_number", "units": ""},
-        )
-        return xr.concat(all_parts, dim=part_coord)
-
-    def dpw(self):
-        """Wave spreading at the peak wave frequency."""
-        raise NotImplementedError(
-            "Wave spreading at the peak wave frequency method not defined"
+        return partition(
+            dset=self._obj,
+            wspd=wsp_darr,
+            wdir=wdir_darr,
+            dpt=dep_darr,
+            swells=swells,
+            agefac=agefac,
+            wscut=wscut,
         )
 
     def stats(self, stats, fmin=None, fmax=None, dmin=None, dmax=None, names=None):
@@ -901,73 +703,3 @@ class SpecArray(object):
                 )
 
         return xr.merge(params).rename(dict(zip(stats_dict.keys(), names)))
-
-
-def wavenuma(ang_freq, water_depth):
-    """Chen and Thomson wavenumber approximation."""
-    k0h = 0.10194 * ang_freq * ang_freq * water_depth
-    D = [0, 0.6522, 0.4622, 0, 0.0864, 0.0675]
-    a = 1.0
-    for i in range(1, 6):
-        a += D[i] * k0h ** i
-    return (k0h * (1 + 1.0 / (k0h * a)) ** 0.5) / water_depth
-
-
-def wavelen(freq, depth=None):
-    """Wavelength L.
-
-    Args:
-        - freq (ndarray): Frequencies (Hz) for calculating L.
-        - depth (float): Water depth, use deep water approximation by default.
-
-    Returns;
-        - L: ndarray of same shape as freq with wavelength for each frequency.
-
-    """
-    if depth is not None:
-        ang_freq = 2 * np.pi * freq
-        return 2 * np.pi / wavenuma(ang_freq, depth)
-    else:
-        return 1.56 / freq ** 2
-
-
-def celerity(freq, depth=None):
-    """Wave celerity C.
-
-    Args:
-        - freq (ndarray): Frequencies (Hz) for calculating C.
-        - depth (float): Water depth, use deep water approximation by default.
-
-    Returns;
-        - C: ndarray of same shape as freq with wave celerity for each frequency.
-
-    """
-    if depth is not None:
-        ang_freq = 2 * np.pi * freq
-        return ang_freq / wavenuma(ang_freq, depth)
-    else:
-        return 1.56 / freq
-
-
-def hs(spec, freqs, dirs, tail=True):
-    """Significant wave height Hmo.
-
-    Copied as a function so it can be used in a generic context.
-
-    Args:
-        - spec (ndarray): wave spectrum array
-        - freqs (darray): wave frequency array
-        - dirs (darray): wave direction array
-        - tail (bool): if True fit high-frequency tail before integrating spectra
-
-    """
-    df = abs(freqs[1:] - freqs[:-1])
-    if len(dirs) > 1:
-        ddir = abs(dirs[1] - dirs[0])
-        E = ddir * spec.sum(1)
-    else:
-        E = np.squeeze(spec)
-    Etot = 0.5 * sum(df * (E[1:] + E[:-1]))
-    if tail and freqs[-1] > 0.333:
-        Etot += 0.25 * E[-1] * freqs[-1]
-    return 4.0 * np.sqrt(Etot)
