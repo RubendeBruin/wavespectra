@@ -220,10 +220,11 @@ def read_miros(filename):
     elif metadata['Direction_Relative_To'] == 'North':
         dirs = dirs + direction_offset
 
-    # convert S to s
-    spectra = np.array(spectra, dtype=float)
+    dir_bin_width = heading_resolution  # convert to rad
 
-    density = spectra #  / (heading_resolution * freq_resolution)  # Correct to only divide by heading-resolution?
+    # convert S to s ?
+    spectra = np.array(spectra, dtype=float)
+    density = spectra  / dir_bin_width  # Correct to only divide by heading-resolution?
 
     from wavespectra.core.attributes import attrs
 
@@ -232,11 +233,8 @@ def read_miros(filename):
               (attrs.FREQNAME, freqs))
     dimensions = tuple([c[0] for c in coords])
 
-    da = xr.DataArray(
-        data=density, coords=coords, dims=dimensions, name=attrs.SPECNAME
-    )
-
-    dset = da.to_dataset()
+    dset = xr.DataArray(density, coords=coords, dims=dimensions, name=attrs.SPECNAME
+        ).to_dataset(name='efth')
 
     if latt is not None:
         dset[attrs.LATNAME] = ('time', latt)
